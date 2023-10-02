@@ -1308,6 +1308,11 @@ let parse_inline str = function
 let eq : eq =
   {
     f =
+      let ipaddr_equal ip ip' = Ipaddr.compare ip ip' = 0 in
+      let cert_equal c c' =
+        Cstruct.equal (X509.Certificate.fingerprint `SHA256 c)
+          (X509.Certificate.fingerprint `SHA256 c')
+      in
       (fun (type x) (k : x k) (v : x) (v2 : x) ->
         match (k, v, v2) with
         | Secret, (a, b, c, d), (a', b', c', d') ->
@@ -1324,16 +1329,66 @@ let eq : eq =
                 match (a, b) with
                 | `Domain (host_a, ipv_a), `Domain (host_b, ipv_b) ->
                     ipv_a = ipv_b && Domain_name.equal host_a host_b
-                | `Ip a, `Ip b -> 0 = Ipaddr.compare a b
+                | `Ip a, `Ip b -> 0 = ipaddr_equal a b
                 | (`Domain _ | `Ip _), (`Domain _ | `Ip _) -> false)
               remotes_lst remotes_lst2
-        | _ ->
-            (*TODO non-polymorphic comparison*)
-            let eq = v = v2 in
+        | Bind, None, None -> true
+        | Bind, Some _, None | Bind, None, Some _ -> false
+        | Bind, Some (p_o, a_o), Some (p_o', a_o') ->
+          p_o = p_o' &&
+          Option.equal (fun a a' ->
+              match a, a' with
+              | `Domain h, `Domain h' -> Domain_name.equal h h'
+              | `Ip ip, `Ip ip' -> ipaddr_equal ip ip' = 0
+              | `Domain _, `Ip _ | `Ip _, `Domain _ -> false)
+            a_o a_o'
+        | Ca, ca, ca' ->
+          cert_equal ca ca'
+        | Dhcp_dns, ips, ips' ->
+          List.equal (fun ip ip' -> ipaddr_equal ip ip' = 0) ips ips'
+        | Dhcp_ntp, ips, ips' ->
+          List.equal (fun ip ip' -> ipaddr_equal ip ip' = 0) ips ips'
+        | Dhcp_domain, h, h' ->
+          Domain_name.equal h h'
+        | Ifconfig, (ip1, ip2), (ip1', ip2') ->
+          ipaddr_equal ip1 ip1' && ipaddr_equal ip2 ip2'
+        | Route_gateway, `Ip ip, `Ip ip' ->
+          ipaddr_equal ip ip'
+        | Route_gateway, `Ip _, (`Default | `Dhcp)
+        | Route_gateway, (`Default | `Dhcp), `Ip _ ->
+          false
+        | Server, prefix, prefix' ->
+          Ipaddr.V4.Prefix.compare prefix prefix' = 0
+        | (Tls_cert, cert, cert') ->
+          cert_equal cert cert'
+        | (Tls_key, k, k') ->
+          Cstruct.equal
+            (X509.Private_key.encode_der k)
+            (X509.Private_key.encode_der k')
+        | Route_gateway, (`Default | `Dhcp as v), (`Default | `Dhcp as v')
+        | (Auth_nocache, v, v') | (Auth_retry, v, v') | (Auth_user_pass, v, v')
+        | (Auth_user_pass_verify, v, v') | (Cipher, v, v') | (Comp_lzo, v, v')
+        | (Connect_retry, v, v') | (Connect_retry_max, v, v')
+        | (Connect_timeout, v, v') | (Dev, v, v') | (Dhcp_disable_nbt, v, v')
+        | (Float, v, v') | (Handshake_window, v, v') | (Ifconfig_nowarn, v, v')
+        | (Link_mtu, v, v') | (Mssfix, v, v') | (Mute_replay_warnings, v, v')
+        | (Passtos, v, v') | (Persist_key, v, v') | (Persist_tun, v, v')
+        | (Ping_interval, v, v') | (Ping_timeout, v, v') | (Port, v, v')
+        | (Pull, v, v') | (Proto, v, v') | (Remote_cert_tls, v, v')
+        | (Remote_random, v, v') | (Renegotiate_bytes, v, v')
+        | (Renegotiate_packets, v, v') | (Renegotiate_seconds, v, v')
+        | (Replay_window, v, v') | (Resolv_retry, v, v') | (Route, v, v')
+        | (Route_delay, v, v') | (Route_metric, v, v')
+        | (Script_security, v, v') | (Tls_mode, v, v') | (Tls_timeout, v, v')
+        | (Tls_version_min, v, v') | (Topology, v, v')
+        | (Transition_window, v, v') | (Tun_mtu, v, v') | (Verb, v, v')
+        | (Verify_client_cert, v, v') ->
+            (* XXX these should be safe for polymorphic comparison *)
+            let eq = v = v' in
             Log.debug (fun m ->
                 m "eq self-test: @[<v>%a@, %s @,%a@]" pp (singleton k v)
                   (if true then "=" else "<>")
-                  pp (singleton k v2));
+                  pp (singleton k v'));
             eq);
   }
 
