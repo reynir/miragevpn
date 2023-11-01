@@ -265,8 +265,13 @@ module Conf_map = struct
         (fun err -> `Msg ("not a valid config: " ^ err))
         (ensure_mem Cipher "config must specify 'cipher'")
       >>= fun () ->
-      if get Cipher t <> `AES_256_CBC then
-        Error (`Msg "only AES-256-CBC supported in static key mode")
+      (if get Cipher t <> `AES_256_CBC then
+         Error (`Msg "only AES-256-CBC supported in static key mode")
+       else Ok ())
+      >>= fun () ->
+      if mem Ca t && mem Peer_fingerprint t then
+        Error (`Msg "While --ca and --peer-fingerprint are not mutually exclusive \
+                     the semantics are unclear to us and thus not implemented")
       else Ok ()
     else Ok ()
 
