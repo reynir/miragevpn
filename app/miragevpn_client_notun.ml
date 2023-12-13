@@ -38,19 +38,10 @@ let resolve (name, ip_version) =
           `Resolve_failed
       | Ok ip -> `Resolved (Ipaddr.V6 ip))
 
-type action =
-  [ Miragevpn.action
-  | `Suspend
-  | `Transmit of Cstruct.t
-  | `Payload of Cstruct.t ]
-
 let pp_action ppf = function
   | #Miragevpn.action as action -> Miragevpn.pp_action ppf action
-  | `Suspend -> Fmt.pf ppf "suspend"
-  | `Transmit data -> Fmt.pf ppf "transmit %u bytes" (Cstruct.length data)
-  | `Payload data -> Fmt.pf ppf "payload %u bytes" (Cstruct.length data)
 
-let event k (tick : [ `Tick ] Lwt.t) client actions ev =
+let event k (tick : [ `Tick ] Lwt.t) client ev =
   Logs.debug (fun m -> m "event %a" Miragevpn.pp_event ev);
   let tick = match ev with `Tick -> ticker () | _ -> tick in
   match Miragevpn.handle client ev with
@@ -58,12 +49,7 @@ let event k (tick : [ `Tick ] Lwt.t) client actions ev =
       Logs.err (fun m -> m "miragevpn handle failed %a" Miragevpn.pp_error e);
       exit 4
   | Ok (client, outs, payloads, new_action) ->
-      let new_actions =
-        List.map (fun p -> `Payload p) payloads
-        @ List.map (fun out -> `Transmit out) outs
-        @ (Option.to_list new_action :> action list)
-      in
-      k tick client (actions @ new_actions)
+      k tick client outs payloads new_action
 
 let mk_ifconfig (ip_config, mtu) =
   { ip_config; mtu; ping = pinger (); seq_no = 0 }
@@ -158,19 +144,6 @@ let rec write_to_fd fd data =
         let+ () = safe_close fd in
         Error (`Msg (Fmt.str "TCP write error %a" Fmt.exn e)))
 
-let transmit proto fd data =
-  match proto with
-  | `Tcp -> write_to_fd fd data
-  | `Udp -> (
-      let* r = Lwt_result.catch (fun () -> Lwt_cstruct.write fd data) in
-      match r with
-      | Ok len when Cstruct.length data <> len ->
-          Lwt_result.fail (`Msg "wrote short UDP packet")
-      | Ok _ -> Lwt_result.return ()
-      | Error exn ->
-          let+ () = safe_close fd in
-          Error (`Msg (Fmt.str "UDP write error %a" Fmt.exn exn)))
-
 let receive _proto fd =
   let buf = Cstruct.create_unsafe 65535 in
   let* r = Lwt_result.catch (fun () -> Lwt_cstruct.recvfrom fd buf []) in
@@ -184,15 +157,92 @@ let receive _proto fd =
       Logs.err (fun m -> m "Receive error %a" Fmt.exn exn);
       exit 3
 
-let rec established_action proto fd incoming ifconfig tick client actions =
-  let action, actions =
-    match actions with
-    | action :: actions -> ((action :> action), actions)
-    | [] -> (`Suspend, actions)
+let transmit proto fd data =
+  match proto with
+  | `Tcp -> write_to_fd fd data
+  | `Udp -> (
+      let* r = Lwt_result.catch (fun () -> Lwt_cstruct.write fd data) in
+      match r with
+      | Ok len when Cstruct.length data <> len ->
+          Lwt_result.fail (`Msg "wrote short UDP packet")
+      | Ok _ -> Lwt_result.return ()
+      | Error exn ->
+          let+ () = safe_close fd in
+          Error (`Msg (Fmt.str "UDP write error %a" Fmt.exn exn)))
+
+let send_recv proto fd =
+  (* 16 is arbitrarily chosen *)
+  (* XXX: use a regular queue?! *)
+  let send_queue, send = Lwt_stream.create_bounded 16 in
+  let recv_mvar = Lwt_mvar.create_empty () in
+  let fd' =
+    object(_)
+      method send data =
+        if send#blocked then
+          Logs.info (fun m -> m "dropping packet")
+        else
+          Lwt.async (fun () -> send#push (`Transmit data))
+      method recv =
+        Lwt_mvar.take recv_mvar
+      method close =
+        send#close; safe_close fd
+    end
   in
-  Logs.debug (fun m -> m "established_action %a" pp_action action);
+  let rec transmitter () =
+    let* ev =
+      Lwt.catch
+        (fun () ->
+           let* (`Transmit data) = Lwt_stream.next send_queue in
+           let* r = transmit proto fd data in
+           match r with
+           | Ok () -> Lwt.return `Continue
+           | Error `Msg e ->
+             Logs.warn (fun m -> m "Error transmitting packet: %s" e);
+             Lwt.return `Close)
+        (function
+          | Lwt_stream.Empty ->
+            Lwt.return `Close
+          | e -> Lwt.reraise e)
+    in
+    match ev with
+    | `Close ->
+      (match Lwt_stream.get_available send_queue with
+       | [] -> ()
+       | _ :: _ as pkts ->
+         Logs.warn (fun m -> m "Dropping %d unsent packets" (List.length pkts)));
+      fd'#close
+    | `Continue -> transmitter ()
+  in
+  let rec receiver () =
+    let buf = Cstruct.create_unsafe 65535 in
+    let* r = Lwt_result.catch (fun () -> Lwt_cstruct.recvfrom fd buf []) in
+    match r with
+    | Ok (len, _) ->
+      Logs.debug (fun m -> m "received %d bytes" len);
+      let* () = Lwt_mvar.put recv_mvar (`Data (Cstruct.sub buf 0 len)) in
+      receiver ()
+    | Error exn ->
+      let* () = fd'#close in
+      (* XXX: emit `Connection_failed?! *)
+      Logs.err (fun m -> m "Receive error %a" Fmt.exn exn);
+      Lwt_mvar.put recv_mvar `Connection_failed
+  in
+  Lwt.async transmitter;
+  Lwt.async receiver;
+  fd'
+
+let rec established_action proto fd incoming ifconfig tick client outs pkts action =
+  Logs.debug (fun m -> m "established_action %a" Fmt.(option ~none:(any "suspend") pp_action) action);
+  List.iter (fun data -> fd#send data) outs;
+  let* () = Lwt.pause () in
+  List.iter (fun data ->
+      match pong ifconfig data with
+      | Ok (_id, seq_no) ->
+          Logs.app (fun m -> m "Received pong icmp_seq=%d" seq_no)
+      | Error msg -> Logs.app (fun m -> m "Received unexpected data: %s" msg))
+    pkts;
   match action with
-  | `Suspend -> (
+  | None -> (
       let* ev =
         Lwt.choose
           [
@@ -203,14 +253,14 @@ let rec established_action proto fd incoming ifconfig tick client actions =
       in
       match ev with
       | `Data _ as ev ->
-          let incoming = receive proto fd in
+          let incoming = fd#recv in
           event
             (established_action proto fd incoming ifconfig)
-            tick client actions ev
+            tick client ev
       | #Miragevpn.event as ev ->
           event
             (established_action proto fd incoming ifconfig)
-            tick client actions ev
+            tick client ev
       | `Ping -> (
           Logs.app (fun m -> m "Sending ping icmp_seq=%d..." ifconfig.seq_no);
           let ifconfig = { ifconfig with ping = pinger () } in
@@ -218,91 +268,69 @@ let rec established_action proto fd incoming ifconfig tick client actions =
           match Miragevpn.outgoing client data with
           | Ok (client, data) ->
               established_action proto fd incoming ifconfig tick client
-                (`Transmit data :: actions)
+                [data] [] None
           | Error `Not_ready ->
               Logs.warn (fun m ->
                   m
                     "Trying to ping when miragevpn state machine is not ready; \
                      this should never happen");
-              established_action proto fd incoming ifconfig tick client actions)
+              established_action proto fd incoming ifconfig tick client [] [] None)
       )
-  | `Payload data ->
-      (match pong ifconfig data with
-      | Ok (_id, seq_no) ->
-          Logs.app (fun m -> m "Received pong icmp_seq=%d" seq_no)
-      | Error msg -> Logs.app (fun m -> m "Received unexpected data: %s" msg));
-      established_action proto fd incoming ifconfig tick client actions
-  | `Exit -> Lwt_result.fail (`Msg "Exiting due to Miragevpn engine exit")
-  | `Transmit data ->
-      let* r = transmit proto fd data in
-      (match r with
-      | Ok () -> ()
-      | Error (`Msg e) ->
-          Logs.err (fun m -> m "transmit error: %s" e);
-          exit 3);
-      established_action proto fd incoming ifconfig tick client actions
-  | `Established _ ->
+  | Some `Exit -> Lwt_result.fail (`Msg "Exiting due to Miragevpn engine exit")
+  | Some (`Established _ as action) ->
       Logs.err (fun m -> m "Unexpected action %a" pp_action action);
       assert false
-  | (`Connect _ | `Resolve _) as action ->
-      let* () = safe_close fd in
-      connecting_action tick client (action :: actions)
+  | Some (`Connect _ | `Resolve _) as action ->
+      let* () = fd#close in
+      connecting_action tick client [] [] action
 
-and connected_action proto fd incoming tick client actions =
-  let action, actions =
-    match actions with
-    | action :: actions -> ((action :> action), actions)
-    | [] -> (`Suspend, actions)
-  in
-  Logs.debug (fun m -> m "connected_action %a" pp_action action);
+and connected_action proto fd incoming tick client outs pkts action =
+  Logs.debug (fun m -> m "connected_action %a" Fmt.(option ~none:(any "suspend") pp_action) action);
+  (match pkts with
+   | [] -> ()
+   | _ ->
+     Logs.warn (fun m -> m "Dropping %d unexpected received tunnel packets" (List.length pkts)));
+  List.iter (fun data -> fd#send data) outs;
+  let* () = Lwt.pause () in
   match action with
-  | `Suspend ->
+  | None ->
       let* ev =
-        Lwt.choose [ (tick :> [ `Tick | `Data of Cstruct.t ] Lwt.t); incoming ]
+        Lwt.choose [ (tick :> [ `Tick | `Data of Cstruct.t | `Connection_failed ] Lwt.t); incoming ]
       in
       let incoming =
-        match ev with `Data _ -> receive proto fd | _ -> incoming
+        match ev with `Data _ -> fd#recv | _ -> incoming
       in
       event
         (connected_action proto fd incoming)
-        tick client actions
-        (ev :> Miragevpn.event)
-  | `Established ifconfig ->
+        tick client (ev :> Miragevpn.event)
+  | Some `Established ifconfig ->
       Logs.info (fun m ->
           m "Connection established! %a" Miragevpn.pp_ip_config (fst ifconfig));
       let ifconfig = mk_ifconfig ifconfig in
-      established_action proto fd incoming ifconfig tick client actions
-  | `Exit -> Lwt_result.fail (`Msg "Exiting due to Miragevpn engine exit")
-  | `Transmit data ->
-      let* r = transmit proto fd data in
-      (match r with
-      | Ok () -> ()
-      | Error (`Msg e) ->
-          Logs.err (fun m -> m "transmit error: %s" e);
-          exit 3);
-      connected_action proto fd incoming tick client actions
-  | `Payload _ ->
-      Logs.err (fun m -> m "Unexpected action %a" pp_action action);
-      assert false
-  | (`Connect _ | `Resolve _) as action ->
-      let* () = safe_close fd in
-      connecting_action tick client (action :: actions)
+      established_action proto fd incoming ifconfig tick client [] [] None
+  | Some `Exit -> Lwt_result.fail (`Msg "Exiting due to Miragevpn engine exit")
+  | Some (`Connect _ | `Resolve _) as action ->
+      let* () = fd#close in
+      connecting_action tick client [] [] action
 
-and connecting_action tick client actions =
-  let action, actions =
-    match actions with
-    | action :: actions -> (action, actions)
-    | [] -> (`Suspend, actions)
-  in
-  Logs.debug (fun m -> m "connecting_action %a" pp_action action);
+and connecting_action tick client outs pkts action =
+  Logs.debug (fun m -> m "connecting_action %a" Fmt.(option ~none:(any "suspend") pp_action) action);
+  (match pkts with
+   | [] -> ()
+   | _ ->
+     Logs.warn (fun m -> m "Dropping %d unexpected received tunnel packets" (List.length pkts)));
+  (match outs with
+   | [] -> ()
+   | _ ->
+     Logs.warn (fun m -> m "Dropping %d unexpected outgoing packets" (List.length outs)));
   match action with
-  | `Suspend ->
+  | None ->
       let* `Tick = tick in
-      event connecting_action tick client actions `Tick
-  | `Resolve data ->
+      event connecting_action tick client `Tick
+  | Some `Resolve data ->
       let* ev = resolve data in
-      event connecting_action tick client actions ev
-  | `Connect (addr, port, proto) ->
+      event connecting_action tick client ev
+  | Some `Connect (addr, port, proto) ->
       let dom =
         Ipaddr.(Lwt_unix.(match addr with V4 _ -> PF_INET | V6 _ -> PF_INET6))
       and unix_ip = Ipaddr_unix.to_inet_addr addr in
@@ -315,7 +343,8 @@ and connecting_action tick client actions =
           (fun () ->
             let+ () = Lwt_unix.connect fd (ADDR_INET (unix_ip, port)) in
             Logs.app (fun m -> m "Connected to %a:%d" Ipaddr.pp addr port);
-            let incoming = receive proto fd in
+            let fd = send_recv proto fd in
+            let incoming = fd#recv in
             (`Connected, connected_action proto fd incoming))
           (fun e ->
             Logs.err (fun m ->
@@ -325,9 +354,9 @@ and connecting_action tick client actions =
             (`Connection_failed, connecting_action))
       in
       let* ev, k = connect in
-      event k tick client actions ev
-  | `Exit -> Lwt_result.fail (`Msg "Exiting due to Miragevpn engine exit")
-  | `Established _ | `Payload _ | `Transmit _ ->
+      event k tick client ev
+  | Some `Exit -> Lwt_result.fail (`Msg "Exiting due to Miragevpn engine exit")
+  | Some (`Established _ as action) ->
       Logs.err (fun m -> m "Unexpected action %a" pp_action action);
       assert false
 
@@ -344,7 +373,7 @@ let establish_tunnel config pkcs12_password =
         let+ () = Lwt_unix.sleep 1. in
         `Tick
       in
-      connecting_action tick client [ (action :> action) ]
+      connecting_action tick client [] [] (Some (action :> Miragevpn.action))
 
 let string_of_file ~dir filename =
   let file =
