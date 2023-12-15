@@ -172,46 +172,64 @@ let transmit proto fd data =
 
 let send_recv proto fd =
   (* 16 is arbitrarily chosen *)
-  (* XXX: use a regular queue?! *)
-  let send_queue, send = Lwt_stream.create_bounded 16 in
+  let max_send = 16 in
+  let send_queue = Queue.create () in
+  let send_condition = Lwt_condition.create () in
   let recv_mvar = Lwt_mvar.create_empty () in
+  let clear_send_queue send_queue =
+      let unsent = Queue.length send_queue in
+      if unsent > 0 then
+        Logs.warn (fun m -> m "Dropping %d unsent packets" unsent);
+      Queue.clear send_queue
+  in
   let fd' =
     object(_)
       method send data =
-        if send#blocked then
+        if Queue.length send_queue >= max_send then
           Logs.info (fun m -> m "dropping packet")
         else
-          Lwt.async (fun () -> send#push (`Transmit data))
+          (Queue.add (`Transmit data) send_queue;
+           Lwt_condition.signal send_condition ())
       method recv =
         Lwt_mvar.take recv_mvar
       method close =
-        send#close; safe_close fd
+        clear_send_queue send_queue;
+        Queue.add `Stop send_queue;
+        Lwt_condition.signal send_condition ();
+        safe_close fd
     end
   in
   let rec transmitter () =
     let* ev =
-      Lwt.catch
-        (fun () ->
-           let* (`Transmit data) = Lwt_stream.next send_queue in
-           let* r = transmit proto fd data in
-           match r with
-           | Ok () -> Lwt.return `Continue
-           | Error `Msg e ->
-             Logs.warn (fun m -> m "Error transmitting packet: %s" e);
-             Lwt.return `Close)
-        (function
-          | Lwt_stream.Empty ->
-            Lwt.return `Close
-          | e -> Lwt.reraise e)
+      let* () =
+        if Queue.is_empty send_queue then
+          Lwt_condition.wait send_condition
+        else
+          Lwt.return_unit
+      in
+      match Queue.take send_queue with
+      | `Stop -> Lwt.return `Stop
+      | `Transmit data ->
+        Logs.debug (fun m -> m "Sending one packet of %d" (Queue.length send_queue + 1));
+        Lwt.catch
+          (fun () ->
+             let* r = transmit proto fd data in
+             match r with
+             | Ok () -> Lwt.return `Continue
+             | Error `Msg e ->
+               Logs.warn (fun m -> m "Error transmitting packet: %s" e);
+               Lwt.return `Close)
+          (function
+            | Lwt_stream.Empty ->
+              Lwt.return `Close
+            | e -> Lwt.reraise e)
     in
     match ev with
-    | `Close ->
-      (match Lwt_stream.get_available send_queue with
-       | [] -> ()
-       | _ :: _ as pkts ->
-         Logs.warn (fun m -> m "Dropping %d unsent packets" (List.length pkts)));
-      fd'#close
     | `Continue -> transmitter ()
+    | `Stop -> Lwt.return_unit
+    | `Close ->
+      clear_send_queue send_queue;
+      fd'#close
   in
   let rec receiver () =
     let buf = Cstruct.create_unsafe 65535 in
